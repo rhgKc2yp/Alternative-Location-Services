@@ -1,4 +1,4 @@
-name: Build Android APK
+name: Build and Sign Android APK
 
 on:
   push:
@@ -51,4 +51,95 @@ jobs:
           name: AltLocationServices-unsigned-release
           path: app/build/outputs/apk/release/app-release-unsigned.apk
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 7
+
+  sign:
+    name: Sign and verify release APK
+    # Pull requests only build unsigned APKs; signing secrets never enter PR jobs.
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Set up Java 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK Build Tools
+        run: sdkmanager --install "build-tools;35.0.0"
+
+      - name: Download unsigned APK
+        uses: actions/download-artifact@v8
+        with:
+          name: AltLocationServices-unsigned-release
+          path: unsigned
+
+      - name: Decode release keystore
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for secret_name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [[ -z "${!secret_name}" ]]; then
+              echo "::error::Missing Actions secret: ${secret_name}. Add it under Settings > Secrets and variables > Actions."
+              exit 1
+            fi
+          done
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/android-release-keystore"
+          test -s "$RUNNER_TEMP/android-release-keystore"
+          chmod 600 "$RUNNER_TEMP/android-release-keystore"
+
+      - name: Align, sign and verify release APK
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          # Optional repository variable: set ANDROID_KEYSTORE_TYPE=JKS for legacy JKS keystores.
+          ANDROID_KEYSTORE_TYPE: ${{ vars.ANDROID_KEYSTORE_TYPE || 'PKCS12' }}
+        run: |
+          set -euo pipefail
+          tools="${ANDROID_HOME}/build-tools/35.0.0"
+          unsigned="unsigned/app-release-unsigned.apk"
+          aligned="${RUNNER_TEMP}/app-release-aligned.apk"
+          signed="signed/AltLocationServices-release-signed.apk"
+          test -s "$unsigned"
+          mkdir -p signed
+
+          "$tools/zipalign" -P 16 -f 4 "$unsigned" "$aligned"
+          "$tools/apksigner" sign \
+            --ks "${RUNNER_TEMP}/android-release-keystore" \
+            --ks-type "$ANDROID_KEYSTORE_TYPE" \
+            --ks-key-alias "$ANDROID_KEY_ALIAS" \
+            --ks-pass env:ANDROID_KEYSTORE_PASSWORD \
+            --key-pass env:ANDROID_KEY_PASSWORD \
+            --out "$signed" \
+            "$aligned"
+
+          "$tools/apksigner" verify --verbose --print-certs "$signed"
+          "$tools/zipalign" -c -P 16 4 "$signed"
+          test -s "$signed"
+
+      - name: Upload signed release APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: AltLocationServices-signed-release
+          path: signed/AltLocationServices-release-signed.apk
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove temporary signing files
+        if: always()
+        shell: bash
+        run: |
+          rm -f "$RUNNER_TEMP/android-release-keystore" "$RUNNER_TEMP/app-release-aligned.apk"
